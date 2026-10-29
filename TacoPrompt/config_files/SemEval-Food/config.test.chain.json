@@ -81,7 +81,7 @@
         "lc": 1.0,
         "anneal": 1,
         "epochs": 100,
-        "test_batch_size": 775,
+        "test_batch_size": 32,
         "save_dir": "data/saved/semeval_food/",
         "save_period": 20,
         "verbosity": 2,

@@ -142,7 +142,7 @@ class TrainerTEMP(Trainer):
         log = {'epoch avg loss': total_loss / len(self.data_loader)}
 
         # Validation stage
-        if self.do_validation and epoch >= 40:
+        if self.do_validation and epoch >= 40:           #前 40epoch 模型快速学习分类图的基础结构，从第40epoch才开始跑验证集（判断是否早停），节省算力。
             if epoch == 40:
                 self._save_checkpoint(epoch=epoch, save_best=False)
             val, leaf_val, nonleaf_val = self._test('validation')
