@@ -1,0 +1,13 @@
+[submit time] 2026-11-08
+[workdir] ~/landou0510/project/TacoPrompt/TacoPrompt
+[command]
+cd ~/landou0510/project/TacoPrompt/TacoPrompt && sbatch slurm/train_hidden_verb.slurm
+[sbatch output]
+Submitted batch job 126581
+[job] tp_hid_verb  partition=RTX4090  nodelist=TBD (exclude=main-1)
+[task] TacoPrompt hidden 变体训练 —— Wordnet-Verb (SemEval-Verb)
+[python]
+python train.py --config config_files/SemEval-V/config.test.hidden.json
+[logs]
+slurm/out/train_hidden_verb_126581.out
+slurm/out/train_hidden_verb_126581.err

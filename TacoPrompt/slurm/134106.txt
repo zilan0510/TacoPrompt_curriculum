@@ -1,0 +1,5 @@
+[submit] 2026-11-22 09:50  sbatch slurm/train_verb_Dc.slurm -> job 134106 (tp_verb_Dc)
+[目的] Verb 压缩课程组 Dc，--tbs 300（避开 2080Ti 验证 OOM；test_batch_size 只影响评测分批，
+       不影响训练结果）
+[结果] FAILED 00:00:12 —— hard_ratio TypeError（代码被回退）
+[重投] -> 134109

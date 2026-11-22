@@ -1,0 +1,16 @@
+[submit time] 2026-11-08 15:30
+[workdir] ~/landou0510/project/TacoPrompt/TacoPrompt
+[command]
+cd ~/landou0510/project/TacoPrompt/TacoPrompt && sbatch slurm/train_hidden_mesh.slurm
+[sbatch output]
+Submitted batch job 126630
+[node] main-5 (RTX4090, 1 GPU)
+[task] TacoPrompt hidden 变体训练 —— MeSH（首次提交 126582 因 wandb 403 秒退，本次加入 WANDB_MODE=offline 后正常开跑）
+[python]
+python train.py --config config_files/mesh/config.test.hidden.json
+[logs]
+slurm/out/train_hidden_mesh_126630.out
+slurm/out/train_hidden_mesh_126630.err
+[note]
+train.py 训练结束后会自动跑一遍完整测试集评估（耗时数小时），
+期间不 dump 排序结果；排序结果由后续 analysis/dump_hidden_rank.py 单独产出。

@@ -1,0 +1,12 @@
+[submit] 2026-11-22 09:50  sbatch slurm/train_verb_D_resume.slurm -> job 134103 (tp_verb_D_rs)
+[目的] Verb 组 D 断点续训。
+  起因: 133627(Verb-D 首轮) 在 epoch40 首次验证时 OOM —— 2080Ti 只有 10.57 GiB，
+        test_batch_size=775 的 MLM logits 需 11.28 GiB；但 checkpoint-epoch40.pth 已落盘
+        (trainer 里先存 ckpt 再跑 validation)。
+  命令: python train.py --config config_files/SemEval-V/config.test.hidden.hardD.json \
+          -r data/saved/wordnet_verb/TacoPromptHidden/1120_211631/models/trial1/checkpoint-epoch40.pth \
+          --tbs 400
+  与 baseline 续训(128390)完全同口径: --tbs 400 + PYTORCH_CUDA_ALLOC_CONF=expandable_segments
+[结果] FAILED 00:00:13 —— TypeError: UnifiedDataLoader.__init__() got an unexpected keyword
+       argument 'hard_ratio'（09:47:54 代码被回退到 HEAD，见 实验记录 §6.2）
+[重投] -> 134107

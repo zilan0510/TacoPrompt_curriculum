@@ -1,0 +1,5 @@
+[submit] 2026-11-20 21:08  sbatch slurm/train_mesh_D.slurm  ->  job 133626
+[group D] 课程（远->近）：L6~L8 -> L4~L8 -> L2~L8 -> L1~L8，rho 0/0.15/0.25/0.35/0.40
+cfg = config_files/mesh/config.test.hidden.hardD.json
+logs = slurm/out/train_mesh_D_133626.out / .err
+watcher = slurm/out/watcher_133626.log

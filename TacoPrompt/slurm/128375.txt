@@ -1,0 +1,27 @@
+[submit time] 2026-11-10 20:55
+[workdir] ~/landou0510/project/TacoPrompt/TacoPrompt
+[command]
+cd ~/landou0510/project/TacoPrompt/TacoPrompt && sbatch slurm/train_hidden_verb_resume.slurm
+[sbatch output]
+Submitted batch job 128375
+[job] tp_verb_resume  partition=RTX4090,RTX3090  exclude=main-1,main-2  time=2-00:00:00
+[status] PENDING (Resources)
+[purpose]
+126656 已把 Verb 训练到 40 epoch 并保存了 checkpoint-epoch40.pth，
+但在 epoch40 的第一次验证（trainer._test('validation')，test_batch_size=775）
+因 MLM logits 需要 11.28 GiB 而 OOM（3090 23.56 GiB）。
+本作业从 epoch40 断点续训（base_trainer._resume_checkpoint: start_epoch=epoch+1,
+恢复 model+optimizer），并把 --tbs 降到 400、开启 expandable_segments 避免再次 OOM。
+验证集 100 query × 51159 候选位置，每个 epoch 验证约 2.5~4 h，early_stop=3。
+[python]
+python train.py --config config_files/SemEval-V/config.test.hidden.json \
+  -r data/saved/wordnet_verb/TacoPromptHidden/1108_155917/models/trial1/checkpoint-epoch40.pth \
+  --tbs 400
+[logs]
+slurm/out/train_hidden_verb_resume_128375.out
+slurm/out/train_hidden_verb_resume_128375.err
+[后续]
+训练循环结束（日志出现 "Training stops." 或跑到 epoch 100）后会打印
+"Testing with best model..."，随后是 1000 query × 51127 候选的全量测试（约 40 h），
+这段对本次统计是重复计算 —— 届时会 scancel 掉，改用 analysis/dump_hidden_rank.py 出排序。
+

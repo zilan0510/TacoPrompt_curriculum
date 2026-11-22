@@ -1,0 +1,5 @@
+[submit] 2026-11-20 21:08  sbatch slurm/train_mesh_C.slurm  ->  job 133625
+[group C] 全 8 层按错误占比加权，hard_ratio=0.30，无课程
+cfg = config_files/mesh/config.test.hidden.hardC.json
+logs = slurm/out/train_mesh_C_133625.out / .err
+watcher = slurm/out/watcher_133625.log

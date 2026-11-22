@@ -23,7 +23,9 @@
             "expand_factor": 40,
             "shuffle": true,
             "num_workers": 0,
-            "cache_refresh_time": 64
+            "cache_refresh_time": 64,
+            "hard_ratio": 0.0,
+            "hard_schedule": []
         }
     },
     "optimizer": {

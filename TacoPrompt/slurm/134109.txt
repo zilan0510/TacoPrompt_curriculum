@@ -1,0 +1,4 @@
+[submit] 2026-11-22 09:54  sbatch slurm/train_verb_Dc.slurm -> job 134109
+[等价于] 134106（Verb 压缩课程 --tbs 300），代码恢复后重投
+[状态] RUNNING @ main-12(RTX2080Ti)
+[守卫] watcher_134109.log（exp_name=Verb-hardDc，4 分片 dump）

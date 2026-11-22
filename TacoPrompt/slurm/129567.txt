@@ -1,0 +1,33 @@
+[submit time] 2026-11-11 07:35
+[workdir] ~/landou0510/project/TacoPrompt/TacoPrompt
+[command]
+MODEL_DIR=data/saved/mesh/TacoPromptHidden/1108_153108/models/trial1 sbatch slurm/run_dump_mesh.slurm 0 2
+[sbatch output]
+Submitted batch job 129567
+[job] tp_dump_mesh shard 0/2   mem=4GB  cpus=4
+[task] MeSH hidden 测试集 Top-10 排序 dump（model_best.pth = epoch43）
+[重跑原因]
+128391 在第一个 chunk 因 dump_hidden_rank.py 的 --verify 自检 device 不匹配崩溃
+（RuntimeError: Expected all tensors to be on the same device, cuda:0 vs cpu），
+已修复为 (ref.cpu().float() - s.cpu())，并加了每 20 个 query 的原子 partial 落盘。
+[python]
+python analysis/dump_hidden_rank.py -c config_files/mesh/config.test.hidden.json \
+  -m data/saved/mesh/TacoPromptHidden/1108_153108/models/trial1/model_best.pth \
+  -o analysis/results/mesh_top10_shard0.json --shard 0 --num_shards 2 --verify
+[logs]
+slurm/out/dump_mesh_129567.out / .err
+[status] PENDING (Priority) —— 集群 GPU 全满
+
+[FAILED] 2026-11-11 09:10 —— 跑了 19/410 个 query (24 min) 后崩溃:
+  FileNotFoundError: 'analysis/results/mesh_top10_shard0.json.partial.tmp'
+  原因: 新增的"每 20 query 落一次 partial"在 _dump() 里 open 临时文件，
+        但 analysis/results/ 目录只在 main() 末尾的最终落盘前才 mkdir，
+        计算节点上该目录不存在 → 写 partial 时崩溃（推理本身没问题）。
+  处理:
+    1) 立刻 mkdir -p analysis/results（同时救下正在跑的 129568）
+    2) _dump() 内部补 mkdir(parents=True, exist_ok=True)
+    3) 顺带核查 --verify 报的 max|ref-fast| = 2.288e-02:
+       CPU(fp32) 对拍两条路径 max|diff| = 9.5e-06、top-10 顺序完全一致
+       → 数学等价，GPU 上的 2e-2 只是 fp16 分批形状导致的舍入差；
+       新增 --verify_full 用项目原版 scorer 全量打分对拍 top-10 集合/顺序
+       （每份数据只需一次，约 2 min），在 129695 里启用。

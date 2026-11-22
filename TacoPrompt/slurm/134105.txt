@@ -1,0 +1,5 @@
+[submit] 2026-11-22 09:50  sbatch slurm/train_verb_Dc.slurm -> job 134105 (tp_verb_Dc)
+[说明] Verb-Dc 第一版，落在 main-12(2080Ti)，未加 --tbs。
+       意识到 2080Ti 上 test_batch_size=775 必然 OOM，随即 scancel 并改成 --tbs 300 重投。
+[结果] FAILED 00:00:16 —— 同样撞上 hard_ratio TypeError（scancel 前已启动）
+[重投] -> 134106 -> 134109

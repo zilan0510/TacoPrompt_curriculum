@@ -1,0 +1,29 @@
+[submit time] 2026-11-11 09:26
+[workdir] ~/landou0510/project/TacoPrompt/TacoPrompt
+[command]
+MODEL_DIR=data/saved/mesh/TacoPromptHidden/1108_153108/models/trial1 EXTRA=--verify_full sbatch slurm/run_dump_mesh.slurm 0 2
+[sbatch output]
+Submitted batch job 129695
+[job] tp_dump_mesh shard 0/2  mem=4GB
+[task] MeSH hidden 测试集 Top-10 排序 dump —— 分片 0 重跑（129567 因 partial 落盘目录缺失崩溃）
+[新增]
+--verify_full: 第一个 query 用项目原版 model.scorer 对全部 42970 个候选位置打分，
+与快路径对比 max|diff|、top-10 集合重合度、顺序是否一致、真实位置 rank 是否相同。
+[python]
+python analysis/dump_hidden_rank.py -c config_files/mesh/config.test.hidden.json \
+  -m data/saved/mesh/TacoPromptHidden/1108_153108/models/trial1/model_best.pth \
+  -o analysis/results/mesh_top10_shard0.json --shard 0 --num_shards 2 --verify --verify_full
+[logs]
+slurm/out/dump_mesh_129695.out / .err
+[status] PENDING (Resources)
+
+[FAILED] 2026-11-11 09:42 —— 跑了 3.5 min（query 0 的快路径 56 个 chunk 已完成）后崩溃:
+  IndexError: index 345 is out of bounds for dimension 0 with size 345
+  （model/model.py:413 get_lm_inputs，self.desc[convert_id(pit[i].item())]）
+根因（已定位）: _verify_full 里 end = start + batch_size 没有 clamp 到候选总数。
+  42970 = 775*55 + 345，最后一个 chunk 实际切片只有 345 个元素，
+  但 torch.ones(end-start) 造了 775 个 label → 循环跑到 i=345 时 pit[345] 越界。
+  （主循环不受影响：fast_scores 内部用 p_idx.shape[0] 造 ones，自洽。）
+修复: end = min(start + batch_size, n_cand)，bs = end - start；并用 stub 单测校验
+  10 个候选 / batch 7 → scorer 收到的批大小 = [7, 3]。
+重跑 → 见 129892.txt

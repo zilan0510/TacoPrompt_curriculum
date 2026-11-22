@@ -1,0 +1,13 @@
+[submit time] 2026-11-08
+[workdir] ~/landou0510/project/TacoPrompt/TacoPrompt
+[command]
+cd ~/landou0510/project/TacoPrompt/TacoPrompt && sbatch slurm/train_hidden_mesh.slurm
+[sbatch output]
+Submitted batch job 126582
+[job] tp_hid_mesh  partition=RTX4090  nodelist=TBD (exclude=main-1)
+[task] TacoPrompt hidden 变体训练 —— MeSH
+[python]
+python train.py --config config_files/mesh/config.test.hidden.json
+[logs]
+slurm/out/train_hidden_mesh_126582.out
+slurm/out/train_hidden_mesh_126582.err

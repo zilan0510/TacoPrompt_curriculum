@@ -1,3 +1,20 @@
+# [导读] dataset.py —— 数据 + 负采样的全部实现（TacoPrompt 论文 §4.4 的自监督样本生成在这里）
+#   三类东西：
+#     1) Taxon          图的节点对象（比价/哈希都按 display_name，去重和 dict key 靠它）
+#     2) MAGDataset     读 .terms/.taxo/.desc 建 networkx 有向图，并切分 train/valid/test
+#     3) RawDataset     继承 torch 的 Dataset：预建正例集合 node2pos、负采样池 all_edges
+#        └─ 四个负采样函数 _get_*_negatives：在 __getitem__ 里被调用，决定「1 个 query 配 1 正 + N 负」
+#   关键函数备忘（不写行号，方便用 Ctrl+F）：
+#     RawDataset.__init__          建 core_subgraph / node2pos / all_edges（一次性，训前跑一次）
+#     RawDataset.__getitem__       返回一个 query 的 16 行，每行 17 字段 ← 数据流起点
+#     _get_negative_positions      分发器（按 sampling_mode 选下面两个之一）
+#     _get_at_most_k_negatives     sampling_mode=0：至多 N 个
+#     _get_exactly_k_negatives     sampling_mode=1（本项目）：恰好 N 个
+#     _my_get_exactly_k_negatives  死代码，从未被调用（可跳过）
+#   与 TaxoDiff 的差别：TacoPrompt 把**每个节点**都直连了 pseudo_leaf（TaxoDiff 只连真叶子），
+#   所以 TacoPrompt 里伪叶的 in_degree = 节点数，而「真叶子」要靠 out_degree==1 判定。
+#   读法：先看 __getitem__ 那张「17 字段 → forward 入参」对照，再回头看 __init__ 里 node2pos/all_edges 怎么来的。
+
 import os
 import pickle
 import random
@@ -73,12 +90,17 @@ class Taxon(object):
             return False
 
     def __eq__(self, other):
+        # [旁批] ★ 只比 display_name。后果：
+        #   「同名不同义」的两个节点会被当成同一个（SemEval-Verb 里同名词很多，有轻微噪音）
+        #   但好处是图里同名节点会自动合并，避免重复候选位置。
         if self.display_name == other.display_name:
             return True
         else:
             return False
 
     def __hash__(self):
+        # [旁批] 与 __eq__ 保持一致（都是 display_name），所以能当 set 元素 / dict key。
+        #   all_edges 是 set of (Taxon,Taxon)，node2edge 是 set of (Taxon,Taxon)，都靠这个方法去重。
         return hash(self.display_name)
 
 
@@ -186,6 +208,10 @@ class MAGDataset(object):
                     self.taxonomy.add_edge(parent_taxon, child_taxon)
 
         # generate vocab
+        # [旁批] 这里出现了两套编号，务必分清（后面 model 里还会出现第三套）：
+        #   tx_id      → .terms 文件里的原始编号（可能是任意整数）
+        #   node_id    → 0..N-1 的连续编号（train_taxon2allemb_id 用的就是另一套，见 RawDataset）
+        #   vocab[i]   → "concept@@@nodeid"，仅用于打印/调试
         # tx_id is the old taxon_id read from {self.name}.terms file, node_id is the new taxon_id from 0 to len(vocab)
         self.tx_id2node_id = {node.tx_id: idx for idx, node in enumerate(self.taxonomy.nodes())}
         self.node_id2tx_id = {v: k for k, v in self.tx_id2node_id.items()}
@@ -218,6 +244,11 @@ class MAGDataset(object):
 
         else:
             print("Partition graph ...")
+            # [旁批] ★ 两种切分策略，config 里默认 partition_pattern='internal'（上面的 else 分支）：
+            #   'leaf'     → 只从叶子节点里抽验证/测试（leaf completion 设定）
+            #   'internal' → 排除根，从其余所有节点里抽（本项目用这个）
+            #   random.seed(47) 写死 → 第一次生成的 .pickle.bin 就是固定的划分，之后都读 pickle。
+            #   验证集/测试集上限 MAX_VALIDATION_SIZE / MAX_TEST_SIZE = 1000，即 WordNet-Verb 上各抽 1000。
             if self.partition_pattern == 'leaf':
                 sampled_node_ids = []
                 for node in self.taxonomy.nodes():
@@ -270,7 +301,8 @@ class MAGDataset(object):
 
 class RawDataset(Dataset):
     def __init__(self, graph_dataset, mode="train", sampling_mode=1, negative_size=32, max_pos_size=100,
-                 expand_factor=64, cache_refresh_time=128, test_topk=-1, tokenizer=None):
+                 expand_factor=64, cache_refresh_time=128, test_topk=-1, tokenizer=None,
+                 hard_ratio=0.0, hard_schedule=None):
         start = time.time()
         self.mode = mode
         self.sampling_mode = sampling_mode
@@ -279,6 +311,15 @@ class RawDataset(Dataset):
         self.expand_factor = expand_factor
         self.cache_refresh_time = cache_refresh_time
         self.test_topk = test_topk
+        # 结构化父节点负采样的状态（先置默认值；train 分支里会再填真实内容）
+        self.hard_ratio = float(hard_ratio) if hard_ratio else 0.0
+        self.hard_schedule = list(hard_schedule) if hard_schedule else []
+        self.cur_epoch = 1
+        self.cur_hard_ratio = 0.0
+        self.cur_layers = []
+        self._layer_cache = {}
+        self._all_pool_set = set()
+        self.hard_stats = self._new_hard_stats()
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
 
         self.taxon2id = graph_dataset.taxon2node_id
@@ -286,11 +327,16 @@ class RawDataset(Dataset):
 
         full_graph = graph_dataset.taxonomy
         # xu: MAG-CS, 去自环
+        # [旁批] 去自环很关键：有自环的话 nx.descendants 会把节点当成自己的后代，
+        #   all_edges 里就会出现 (x, x)，而位置 (p,q,c) 要求 p != c。
         full_graph.remove_edges_from(nx.selfloop_edges(full_graph))
 
         # self.full_graph = full_graph
         train_nodes = [self.id2taxon[node_id] for node_id in graph_dataset.train_node_ids]
         roots = [node for node in full_graph.nodes() if full_graph.in_degree(node) == 0]
+        # [旁批] pseudo_root：虚拟根，连向所有入度为 0 的节点。
+        #   作用：保证「每个节点都有父」，否则顶层节点的正例位置（父×子）会是空集，无法算 rank。
+        #   代价：会多出一大批 (pseudo_root, c) 的候选位置（占总池子约 23%），且它的 description 是空串。
         self.pseudo_root_node = Taxon(tx_id='', norm_name='', display_name='pseudo root')
         full_graph.add_node(self.pseudo_root_node)
         for node in roots:
@@ -317,6 +363,13 @@ class RawDataset(Dataset):
                 print('holding out subgraph')
                 self.pseudo_leaf_node = Taxon(tx_id='', norm_name='', display_name='pseudo leaf')
                 self.core_subgraph.add_node(self.pseudo_leaf_node)
+                # [旁批] ★ 与 TaxoDiff 的重要差异：这里把**每一个节点**都直连到 pseudo_leaf，
+                #   而 TaxoDiff 只连 out_degree==0 的真叶子。两个后果：
+                #     1) pseudo_leaf 的 in_degree = 节点总数，它是全图唯一的 sink
+                #     2) 每个节点的 children 都包含 pseudo_leaf，所以后面必须用
+                #        `if len(children) > 1: children.remove(pseudo_leaf)` 把它剔掉，
+                #        否则所有节点都会被当成「能挂克节点」，正例位置全部爆炸。
+                #   好处：任意 query 都能表达成「插入为叶子」（父=真父，子=pseudo_leaf），连非叶子节点也有这个选项。
                 for node in list(self.core_subgraph.nodes()):
                     self.core_subgraph.add_edge(node, self.pseudo_leaf_node)
 
@@ -334,6 +387,10 @@ class RawDataset(Dataset):
             self.taxon2id[self.pseudo_root_node] = len(full_graph.nodes) - 1
             self.id2taxon[len(full_graph.nodes)] = self.pseudo_leaf_node
             self.id2taxon[len(full_graph.nodes) - 1] = self.pseudo_root_node
+            # [旁批?] 注意：pseudo_root 已经在 full_graph 里了（上面 add_node 过），所以 len(full_graph.nodes)-1
+            #   很可能和某个真实节点的 node_id 撞车。实测没出问题（因为 taxon2id 是反向字典，覆盖后自洽），
+            #   但如果要改 dataset 结构，这一行值得重新检查。
+            # [旁批] 因为所有节点都连了 pseudo_leaf，所以「真叶子」的判据变成 out_degree == 1（只有那条虚拟边）。
             self.leaf_nodes = [node for node in self.core_subgraph.nodes() if self.core_subgraph.out_degree(node) == 1]
 
             # add interested node list and subgraph
@@ -341,10 +398,19 @@ class RawDataset(Dataset):
             # self.node_list = [n for n in train_nodes if n not in roots]
             self.node_list = [n for n in train_nodes if n != self.pseudo_root_node]
             # getitem的idx找到对应的taxon，使用在all_embed中找对应的结构emb
+            # [旁批] ★ 第三套编号登场，三套要分清（这是本项目最容易搞错的地方）：
+            #   node_id    → 全图 0..N-1（graph_dataset.taxon2node_id，taxon2id 就是它）
+            #   allemb_id  → core_subgraph 里的行号（下面这两个字典，pit/qit/cit 存的就是它）
+            #   idx        → node_list 的下标（DataLoader 传给 __getitem__ 的 idx）
+            #   转换关系：allemb_id --train_allemb_id2taxon--> Taxon --taxon2id--> node_id
+            #   模型里的 convert_id(id) 就是走这条路径。两套编号不相等，直接混用会取到错的概念描述。
             self.train_allemb_id2taxon = {idx: taxon for idx, taxon in enumerate(self.core_subgraph.nodes())}
             self.train_taxon2allemb_id = {v: k for k, v in self.train_allemb_id2taxon.items()}
 
             # For TEMP: 加入path
+            # [旁批] parent2paths 只被 TEMPCompletion（baseline）用，TacoPromptHidden / Chain 都不读。
+            #   内容：每个节点从 pseudo_root 出发的一条最短路径（节点的 norm_name 串成字符串）。
+            #   不管跑不跑 TEMP，这个文件都会被生成并缓存成 parent2paths.pickle。
             print("adding parent2path...")
             datapath = os.path.split(graph_dataset.data_path)[0]
             path_pickle_path = os.path.join(datapath, 'parent2paths.pickle')
@@ -372,11 +438,17 @@ class RawDataset(Dataset):
 
             # build node2pos, node2edge
             print('building node2pos, node2edge')
+            # [旁批] 四个字典构成「一个 query 的局部结构」，也是负采样的过滤依据：
+            #   node2parents / node2children → 判定 yp / yc（负例也分「父对子错」「父错子对」）
+            #   node2edge  → 与 query 直接相邻的边（负采样必须排除，否则会采到真边）
+            #   node2pos   → 正例位置集 = 父集合 × 子集合（笛卡尔积，所以可能不止一个）
             self.node2pos, self.node2edge = {}, {}
             self.node2parents, self.node2children = {}, {}
             for node in self.node_list:
                 parents = set(self.core_subgraph.predecessors(node))
                 children = set(self.core_subgraph.successors(node))
+                # [旁批] 因为所有节点都连了 pseudo_leaf，所以多个子时必须把伪叶剔掉；
+                #   只剩一个子且它是伪叶时则保留 —— 这就是「插入为叶子」的表示。
                 if len(children) > 1:
                     children = [i for i in children if i != self.pseudo_leaf_node]
                 node_pos_edges = [(pre, suc) for pre in parents for suc in children if pre != suc]
@@ -390,6 +462,11 @@ class RawDataset(Dataset):
                 self.node2children[node] = children
 
             print('building valid and test node list')
+            # [旁批] valid/test 的节点已经从 core_subgraph 里删掉了，所以要单独建两件事：
+            #   valid_holdout_subgraph / test_holdout_subgraph  → 包含「train + 这批待测节点」的图（有真实父子关系）
+            #   valid_node2pos / test_node2pos                  → 每个待测 query 的正确插入位置
+            # 注意：holdout 图里待测节点的子仍然指向 pseudo_leaf（下面那个 out_degree==0 循环），
+            #   但这里只对「出度为 0」的节点加边，而不是全部 —— 与 core_subgraph 的做法不一致。
             self.valid_node_list = [self.id2taxon[node_id] for node_id in graph_dataset.validation_node_ids]
             if graph_pickled:
                 self.valid_holdout_subgraph = graphs['valid_subgraph']
@@ -426,9 +503,15 @@ class RawDataset(Dataset):
                     }, f, protocol=pickle.HIGHEST_PROTOCOL)
 
             # used for sampling negative positions during train/validation stage
+            # [旁批] ★ 负采样候选池：core_subgraph 里所有「祖先, 后代」对（不是所有边）。
+            #   SemEval-Verb 实测：11938 个节点 / 23904 条边 → 51159 个候选位置，其中直接边只占 46.7%。
+            #   random.shuffle 只洗一次，之后靠指针顺序切片 —— 相当于「每轮把 5 万张牌洗一次，然后顺序切」。
             self.pointer = 0
             self.all_edges = list(self._get_candidate_positions(self.core_subgraph))
             random.shuffle(self.all_edges)
+            # [旁批] node2pos_node：每个 query 的「父集合 / 子集合」，并把相邻边也加进去。
+            #   只被 _my_get_exactly_k_negatives 使用，而那个函数从未被调用 → 这里算完基本是只写不读。
+            #   （属于早期试验的遗留物，可跳过细读。）
             self.node2pos_node = {}
             tot = 0
             for node, eles in self.node2pos.items():
@@ -446,14 +529,223 @@ class RawDataset(Dataset):
                 for ele in eles:
                     self.node2pos_node[node][0].add(ele[0])
                     self.node2pos_node[node][1].add(ele[1])
-            
+
+            # ===== 结构化父节点负采样（课程学习）=====
+            # 依据：错误分析里「父错子对」的 1~9 类（第 10 类 = 无公共祖先 / pseudo root，
+            #       没有可定位的结构特征，不主动采样）。
+            # hard_ratio <= 0 且 hard_schedule 为空时，整条路径不消耗任何额外 RNG，
+            # 行为与改造前逐位一致（可用于确认 baseline 未被改动）。
+            self.hard_ratio = float(hard_ratio) if hard_ratio else 0.0
+            self.hard_schedule = list(hard_schedule) if hard_schedule else []
+            self.cur_epoch = 1
+            self.cur_hard_ratio = 0.0
+            self.cur_layers = []
+            self._layer_cache = {}                    # p0 -> {layer: [候选父, ...]}（按 p0 缓存，跨 epoch 复用）
+            self._all_pool_set = set(self.all_edges)  # 合法性校验用
+            self.hard_stats = self._new_hard_stats()
+            if self.hard_ratio > 0 or self.hard_schedule:
+                self.set_epoch(1)
+
         end = time.time()
         print(f"Finish loading dataset ({end - start} seconds)")
+
+    # ------------------------------------------------------------------ #
+    #           结构化父节点负采样（课程学习）工具函数                      #
+    # ------------------------------------------------------------------ #
+    # 各层权重 = 两份错误分析里「叶子 query 父错子对」各层占比的平均值
+    LAYER_WEIGHTS = {1: 5.27, 2: 8.31, 3: 5.19, 4: 2.13, 5: 2.49, 6: 0.71, 7: 0.46, 8: 0.52}
+
+    @staticmethod
+    def _new_hard_stats():
+        return {
+            'hard': 0,
+            'rand': 0,
+            'shortfall': 0,                               # 某层池子不足配额、被迫放回补齐的次数
+            'empty_layer': {i: 0 for i in range(1, 9)},   # 某层池子为空、配额作废的次数
+            'layer_hist': {i: 0 for i in range(1, 9)},    # 实际采到的各层数量
+        }
+
+    def set_epoch(self, epoch):
+        """由 trainer 在每个 epoch 开头调用，推进课程阶段（由远及近：L6~L8 → L4 → L2 → L1）。"""
+        self.cur_epoch = epoch
+        self.cur_hard_ratio = 0.0
+        self.cur_layers = []
+        for end_epoch, ratio, layers in self.hard_schedule:
+            if epoch <= end_epoch:
+                self.cur_hard_ratio = float(ratio)
+                self.cur_layers = list(layers)
+                break
+        else:
+            if self.hard_schedule:                       # 超出最后一段：沿用最后一段
+                _, ratio, layers = self.hard_schedule[-1]
+                self.cur_hard_ratio = float(ratio)
+                self.cur_layers = list(layers)
+
+        # 兜底：没配 schedule 但给了 hard_ratio → 全程固定比例 + 全 8 层
+        if not self.hard_schedule and self.hard_ratio > 0:
+            self.cur_hard_ratio = self.hard_ratio
+            self.cur_layers = list(range(1, 9))
+
+        if not self.cur_layers:                          # warmup：层列表为空 → 强制关掉 hard
+            self.cur_hard_ratio = 0.0
+
+        self.hard_stats = self._new_hard_stats()         # 统计按 epoch 归零，便于核对配额
+        print(f'[hard-neg] epoch {epoch}: ratio={self.cur_hard_ratio}, layers={self.cur_layers}')
+
+    def _layers_of(self, p0):
+        """以正确父 p0 为基准，按 core 子图上的 BFS 距离给出各层候选父（结果按 p0 缓存）。
+
+        层定义与错误分析的 10 类一一对应（距离取最短距离）：
+          L1 上 1 跳（直接父）、L2 下 1 跳（直接子）、L3 兄弟、L4 上 2 跳、L5 下 2 跳、
+          L6 上 3 跳、L7 下 3 跳、L8 上/下 4 跳及以上。
+        「与 p0 无公共祖先」的节点不进入任何一层（对应第 10 类，不主动采样）。
+        优先级：祖先/后代 > 兄弟（与错误分析的判定顺序一致）。
+        """
+        if p0 in self._layer_cache:
+            return self._layer_cache[p0]
+
+        up = {p0: 0}                                     # 祖先 -> 距离
+        frontier = [p0]
+        d = 0
+        while frontier:
+            d += 1
+            nxt = []
+            for n in frontier:
+                for pp in self.node2parents.get(n, ()):
+                    if pp not in up:
+                        up[pp] = d
+                        nxt.append(pp)
+            frontier = nxt
+
+        down = {p0: 0}                                   # 后代 -> 距离
+        frontier = [p0]
+        d = 0
+        while frontier:
+            d += 1
+            nxt = []
+            for n in frontier:
+                for ch in self.node2children.get(n, ()):
+                    if ch not in down:
+                        down[ch] = d
+                        nxt.append(ch)
+            frontier = nxt
+
+        layers = {i: [] for i in range(1, 9)}
+        for x, dist in up.items():
+            if dist == 0:
+                continue
+            layers[{1: 1, 2: 4, 3: 6}.get(dist, 8)].append(x)
+        for x, dist in down.items():
+            if dist == 0:
+                continue
+            layers[{1: 2, 2: 5, 3: 7}.get(dist, 8)].append(x)
+
+        # L3 兄弟：所有父的孩子并集，去掉 p0 与已归入祖先/后代层的节点
+        sib = set()
+        for pp in self.node2parents.get(p0, ()):
+            sib.update(self.node2children.get(pp, ()))
+        sib.discard(p0)
+        sib.difference_update(set(up) | set(down))
+        layers[3] = list(sib)
+
+        self._layer_cache[p0] = layers
+        return layers
+
+    def _classify_parent(self, p0, p_prime):
+        """返回 p_prime 相对正确父 p0 的难度层（1..8）；p_prime == p0 返回 0；
+        与 p0 无公共祖先（第 10 类）返回 None。仅用于诊断打印。"""
+        if p_prime is p0:
+            return 0
+        for layer, bucket in self._layers_of(p0).items():
+            if any(p_prime is x for x in bucket):
+                return layer
+        return None
+
+    def _filter_hard(self, bucket, p0, c, pos_set, query_node=None):
+        """逐个候选父做合法性过滤：
+        0) p' 不能是 query 自身（测试时候选池里根本没有 q）
+        1) p' != p0；2) 不能是 pseudo_root / pseudo_leaf（对应「第 10 类」，不主动采）；
+        3) p' 必须在 train_taxon2allemb_id（拼 prompt 要查描述）；
+        4) (p', c) 必须真的在候选池 all_edges 里；5) (p', c) 不能撞上该 query 的其它正例位置。
+        注：pseudo 节点用 == 判等（Taxon.__eq__ 按 display_name），
+        因为 core_subgraph 可能来自 pickle，对象不是同一实例。
+        """
+        out = []
+        for p in bucket:
+            if p is p0 or p == p0:
+                continue
+            if query_node is not None and (p is query_node or p == query_node):
+                continue
+            if p == self.pseudo_root_node or p == self.pseudo_leaf_node:
+                continue
+            if p not in self.train_taxon2allemb_id:
+                continue
+            if (p, c) in pos_set:
+                continue
+            if (p, c) not in self._all_pool_set:
+                continue
+            out.append(p)
+        return out
+
+    def _allocate_quotas(self, n_hard, layers):
+        """在【当前开放层】内按 LAYER_WEIGHTS 重新归一化，用最大余数法拆配额，总和恰为 n_hard。"""
+        ws = {l: self.LAYER_WEIGHTS[l] for l in layers if l in self.LAYER_WEIGHTS}
+        if not ws:
+            return {}
+        total = sum(ws.values())
+        raw = {l: n_hard * w / total for l, w in ws.items()}
+        quota = {l: int(raw[l]) for l in ws}
+        rest = n_hard - sum(quota.values())
+        for l in sorted(ws, key=lambda x: raw[x] - quota[x], reverse=True)[:rest]:
+            quota[l] += 1
+        return quota
+
+    def _get_mixed_negatives(self, query_node, negative_size, positive_positions):
+        """先按层配额取 hard 负例，再补齐随机负例，保证恰好 negative_size 个位置。"""
+        rho = self.cur_hard_ratio
+        if rho <= 0 or not self.cur_layers or not getattr(self, 'node2parents', None):
+            return self._get_negative_positions(query_node, negative_size)
+
+        n_hard = int(round(negative_size * rho))
+        if n_hard <= 0:
+            return self._get_negative_positions(query_node, negative_size)
+
+        p0, c = random.choice(positive_positions)        # 与本次正例对齐，避免正负位置互相矛盾
+        layers = self._layers_of(p0)
+        pos_set = set(self.node2pos[query_node])
+        quota = self._allocate_quotas(n_hard, self.cur_layers)
+
+        hard_negs = []
+        for layer in self.cur_layers:                    # 严格按层遍历，不跨界补
+            need = quota.get(layer, 0)
+            if need <= 0:
+                continue
+            bucket = self._filter_hard(layers.get(layer, ()), p0, c, pos_set, query_node)
+            if not bucket:
+                self.hard_stats['empty_layer'][layer] += 1
+                continue                                 # 配额作废，交给随机部分
+            if len(bucket) >= need:
+                picked = random.sample(bucket, need)
+            else:
+                picked = random.choices(bucket, k=need)  # 池子不足：放回补齐
+                self.hard_stats['shortfall'] += 1
+            hard_negs.extend((p, c) for p in picked)
+            self.hard_stats['layer_hist'][layer] += len(picked)
+
+        hard_negs = list(dict.fromkeys(hard_negs))       # 放回采样可能重复，去重
+        self.hard_stats['hard'] += len(hard_negs)
+
+        n_rand = negative_size - len(hard_negs)
+        rand_negs = self._get_exactly_k_negatives(query_node, n_rand, ignore=hard_negs) if n_rand > 0 else []
+        self.hard_stats['rand'] += len(rand_negs)
+
+        return hard_negs + rand_negs
 
     def __str__(self):
         return f"{self.__class__.__name__} mode:{self.mode}"
 
     def __len__(self):
+        # [旁批] 「项数」= 训练 query 数（11937），不是样本行数。DataLoader 用它算 len(loader)。
         return len(self.node_list)
 
     def __getitem__(self, idx):
@@ -468,6 +760,9 @@ class RawDataset(Dataset):
         q = self.node_list[idx]
 
         # generate positive triplet(s)
+        # [旁批] sampling_mode=1（本项目）：正例只随机取 1 条；=0：正例取全部（超过 max_pos_size 时随机抽）。
+        #   「随机取 1 条」意味着一个 query 的多个真实位置会在不同 epoch 被轮流命中，
+        #   但同一个 epoch 内模型只看得到它的 1 个正确位置 —— 这是 H@k 和 R@k 会产生差异的根源之一。
         if self.sampling_mode == 0:
             positive_positions = self.node2pos[q]
             if len(positive_positions) > self.max_pos_size and self.mode == 'train':
@@ -476,8 +771,14 @@ class RawDataset(Dataset):
             positive_positions = [random.choice(self.node2pos[q])]
 
         # select negative triplet(s)
+        # [旁批?] 这行有 bug：res 此刻还是空列表，所以 len(res) 恒为 0，
+        #   只有当 negative_size == -1 时才会得到 0 个负样本。config 里是 15，走不到那个分支。
         negative_size = len(res) if self.negative_size == -1 else self.negative_size
-        negative_positions = self._get_negative_positions(q, negative_size)
+        # [旁批] ★ 负采样的唯一调用点：一个 query、一个 epoch 只调这一次。
+        #   改造后走 _get_mixed_negatives：先按层配额取结构化 hard 负例，再用原来的随机池补齐。
+        #   hard_ratio=0（且无 hard_schedule）时它内部直接转回原来的纯随机采样，
+        #   且不消耗任何额外 RNG → 与改造前逐位一致。
+        negative_positions = self._get_mixed_negatives(q, negative_size, positive_positions)
 
         # # Tags: position, parent, child, best, worst
         # for p, c in positive_positions:
@@ -502,6 +803,15 @@ class RawDataset(Dataset):
         #                 bool(worst.description)])
         # Tags: position, parent, child, best, worst
         # 加入了p, q, c的idx
+        # [旁批] ★★ 一行 17 个字段，顺序 = collate_fn 解包顺序 = model.forward 的入参。逐列含义：
+        #   0 q.description → qs | 1 p.description → ps | 2 c.description → cs | 3→bs | 4→ws
+        #   5 pct（位置整体对不对）| 6 pt（父对不对）| 7 ct（子对不对）| 8 bt | 9 wt
+        #   10 pe（p 的 description 非空）| 11 ce | 12 be | 13 we
+        #   14 pit | 15 qit | 16 cit （三个「嵌入行号」，即 train_taxon2allemb_id 的值）
+        #   模型真正消费的只有：5/6/7（三态标签）、10/11（两个掩码）、14/15/16（三个行号）。
+        #   qs/ps/cs/bs/ws 虽然被 tokenize 了，但 forward 完全不用（白浪费 CPU）。
+        # [旁批] best/worst 被写死成 pseudo_leaf（description 为空串），所以 be/we 恒为 False、
+        #   bt/wt 基本恒为 1。这两列是 TacoPrompt「最好/最差兄弟」的遗留位，对 TacoPrompt 本身无效。
         for p, c in positive_positions:
             # best, worst = self.get_best_worst_siblings(p, q, g=self.core_subgraph)
             best, worst = self.pseudo_leaf_node, self.pseudo_leaf_node
@@ -515,6 +825,13 @@ class RawDataset(Dataset):
                         int(self.train_taxon2allemb_id[c])])
         for p, c in negative_positions:
             best, worst = self.pseudo_leaf_node, self.pseudo_leaf_node
+            # [旁批] ★ 三态标签（TacoPrompt 相对 TaxoExpan 的关键设计）：
+            #   pct=0 —— 位置一定要错的
+            #   pt = int(p in node2parents[q])  —— 父是对的吗？
+            #   ct = int(c in node2children[q]) —— 子是对的吗？
+            #   于是负例自动分成了「父对子错」「父错子对」「全错」三类，分别用三个 MASK 位学。
+            #   [旁批?] pe/ce 是 bool(description)，意思是「这个节点有没有描述文本」，
+            #   不是「节点存不存在」。pseudo_root / pseudo_leaf 的描述是空串，所以这两类行会被掩掉。
             res.append([q.description, p.description, c.description, best.description, worst.description, 0,
                         int(p in self.node2parents[q]),
                         int(c in self.node2children[q]),
@@ -565,6 +882,11 @@ class RawDataset(Dataset):
         return best, worst
 
     def _get_holdout_subgraph(self, nodes):
+        # [旁批] 用途：拿走 nodes 以外的所有节点，并在被拿走的节点位置「跳过它」直接连边。
+        #   例：A→B→C，B 被拿走 → 子图里补一条 A→C（jump edge）。
+        #   这保证了「待测节点的父/子关系不会因为它不在子图里而丢失」。
+        #   后半段 remove jump edges：如果 A→C 同时已经能通过 A→B'→C 到达，就删掉冗余的 A→C，
+        #   避免同一个层级关系在候选池里出现两次。
         node_to_remove = [n for n in self.full_graph.nodes if n not in nodes]
         subgraph = self.full_graph.subgraph([node for node in nodes]).copy()
         for node in node_to_remove:
@@ -600,11 +922,19 @@ class RawDataset(Dataset):
         return subgraph
 
     def _get_candidate_positions(self, graph):
+        # [旁批] ★ 候选位置池 = 所有「严格祖先, 后代」对，不是所有边。
+        #   descendants 不含自身，所以永远不会出现 (x, x)。
+        #   这里也隐含了「p 不可能是 pseudo_leaf」（它是 sink，没有后代），
+        #   但 p 可能是 pseudo_root（它有无穷多后代，占总池子约 23%）。
         node2descendants = {n: set(descendants(graph, n)) for n in graph.nodes}
         candidates = set(chain.from_iterable([[(n, d) for d in ds] for n, ds in node2descendants.items()]))
         return candidates
 
     def _find_insert_position(self, node_ids, holdout_graph, ignore=[]):
+        # [旁批] 「跳层」就发生在这里：从节点的真实父/子出发 BFS，遇到不在 core_subgraph 的就继续往上/往下钻，
+        #   直到找到第一个「还活着」的节点。所以真值可能跳过中间层（例：真子是 test 节点时，真值会下沉到它的子）。
+        #   实测 SemEval-Verb：父方向跳层 0/1000，子方向 6/1000，所以影响很小。
+        #   [旁批?] 注意 subgraph 是写死的 self.core_subgraph，不是参数传进来的 —— 验证和测试共用同一可见集。
         node2pos = {}
         subgraph = self.core_subgraph
         for node in node_ids:
@@ -633,6 +963,11 @@ class RawDataset(Dataset):
         return node2pos
 
     def _get_negative_positions(self, query_node, negative_size):
+        # [旁批] ★ 负采样分发器。四件事速查：
+        #   ① 数量：由 sampling_mode 决定（0=至多 N，1=恰好 N）
+        #   ② 随机/结构化：两个分支都是「共享候选池 + 全局游标」的结构化取法
+        #   ③ 时机：每个 epoch、每个 query 各调一次；池子只在 __init__ 建一次
+        #   ④ 改造落点：在这里加分流（按 epoch 号 / hard_ratio），并让 trainer 在 epoch 开头刷新游标
         if self.sampling_mode == 0:
             return self._get_at_most_k_negatives(query_node, negative_size)
         elif self.sampling_mode == 1:
@@ -641,6 +976,11 @@ class RawDataset(Dataset):
     def _get_at_most_k_negatives(self, query_node, negative_size):
         """ Generate AT MOST negative_size samples for the query node
         """
+        # [旁批] sampling_mode=0 的分支（本项目不用）。四件事：
+        #   ① 数量：至多 N 个 —— 切片里被过滤掉的不补，所以经常明显少于 N
+        #   ② 随机/结构化：结构化（全局 pointer 顺序切片）；对单个 query 来说不是独立随机采样
+        #   ③ 时机：每个 epoch、每个 query 一次
+        #   ④ 改造：改负采样时可以完全不动这个分支，只改 exactly 那一支
         if self.pointer == 0:
             random.shuffle(self.all_edges)
 
@@ -658,6 +998,18 @@ class RawDataset(Dataset):
     def _get_exactly_k_negatives(self, query_node, negative_size, ignore=[]):
         """ Generate EXACTLY negative_size samples for the query node
         """
+        # [旁批] ★★ 本项目实际使用的分支（config: sampling_mode=1）。四件事：
+        #   ① 数量：恰好 N 个（config 是 15）—— 不够就继续往后切片补，多了截断
+        #   ② 随机/结构化：结构化。all_edges 只在指针回到 0 时洗一次，之后靠全局 pointer 顺序切段，
+        #      所以同一批次相邻 query 拿到的负例在池子里是相邻的（不是每个 query 独立随机采样）
+        #   ③ 时机：每个 epoch、每个 query 一次；pointer 跨 query 累加，所以一个 epoch 会消耗 N_query×N 个槽位
+        #   ④ 改造落点：可以在这里按 hard_ratio 把「随机负例」换成「结构化难负例」，
+        #      基础模板：固定真父向下取子 / 固定真子向上取父 / 兄弟替换（后者必须显式校验合法性）
+        #   两个过滤条件：
+        #      ele not in node2pos[q]  → 不能是 q 的正确位置（父×子）
+        #      ele not in node2edge[q] → 不能正好是 q 的相邻边（(p,q) 或 (q,c)）
+        #      [旁批?] 但 node2edge 只含直接边，所以 (远祖(q), q) 这类候选（把 q 自己当 child）
+        #      不会被过滤，会以负例形式出现 —— 这是这一版的小漏洞。
         if self.pointer == 0:
             random.shuffle(self.all_edges)
 
@@ -679,6 +1031,9 @@ class RawDataset(Dataset):
     def _my_get_exactly_k_negatives(self, query_node, negative_size, ignore=[]):
         """ Generate EXACTLY negative_size samples for the query node
         """
+        # [旁批] 死代码，没有任何地方调用（搜 "_my_get_exactly_k_negatives" 只有定义）。
+        #   它与上面那个版本的区别：要求「两端都不成立」（p 不在父集 且 c 不在子集），更严；
+        #   且对 pseudo_leaf 开了例外。依赖 node2pos_node。可以整段跳过。
         if self.pointer == 0:
             random.shuffle(self.all_edges)
 

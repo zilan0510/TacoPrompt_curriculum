@@ -1,0 +1,5 @@
+
+[FAILED] 2026-11-11 01:26 —— python 在第一个 chunk 崩溃:
+  RuntimeError: Expected all tensors to be on the same device (cuda:0 vs cpu)
+  原因: dump_hidden_rank.py 的 --verify 自检行写成 (ref.cpu().float() - s)，s 仍在 GPU 上；
+  与推理/统计逻辑无关，0 条结果落盘。已修复并改为 129567/129568 重跑。

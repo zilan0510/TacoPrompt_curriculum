@@ -113,3 +113,10 @@ saved_model/
 .vscode/
 .idea/
 __MACOSX/
+
+# 实验产物 / 运行日志（不要进 git）
+slurm/out/
+analysis/results/*.partial
+wandb/
+*.out
+*.err

@@ -1,0 +1,33 @@
+[submit time] 2026-11-08 15:58
+[workdir] ~/landou0510/project/TacoPrompt/TacoPrompt
+[command]
+cd ~/landou0510/project/TacoPrompt/TacoPrompt && sbatch slurm/train_hidden_verb.slurm
+[sbatch output]
+Submitted batch job 126656
+[job] tp_hid_verb  partition=RTX4090,RTX3090  node=main-8 (RTX3090, 24G)
+[result] sacct: State=COMPLETED ExitCode=0:0 Elapsed=1-02:30:00
+         —— 但 python 进程实际是异常退出的，见下
+[终止原因]
+1) 训练本身正常：epoch 1~40 全部跑完（epoch avg loss 收敛到 ~0.003），并在 epoch 40
+   结束时保存了
+   data/saved/wordnet_verb/TacoPromptHidden/1108_155917/models/trial1/checkpoint-epoch40.pth
+2) 崩溃点：trainer 只在 epoch >= 40 才跑第一次验证
+   (trainer/trainer.py: `if self.do_validation and epoch >= 40: ... self._test('validation')`)，
+   验证用 test_batch_size=775 对 51159 个候选位置分批打分；
+   TacoPromptHidden.scorer 走 BertForMaskedLM，会对**全部 256 个 padding 位置**
+   计算 30522 维词表 logits：775×256×30522×2B ≈ 11.28 GiB 的单次分配，
+   而 3090 总显存 23.56 GiB、进程已占 14.92 GiB（其中 11.28 GiB 是 reserved 未分配碎片）
+   → torch.cuda.OutOfMemoryError（见 train_hidden_verb_126656.err 末尾）
+3) model_best.pth 只在验证指标提升时保存，所以本次没有产出 model_best.pth。
+4) State 显示 COMPLETED / ExitCode 0:0 的原因：slurm 脚本最后一条命令是 echo，
+   掩盖了 python 的非零退出码（后续脚本已加 `set -e`）。
+[logs]
+slurm/out/train_hidden_verb_126656.out
+slurm/out/train_hidden_verb_126656.err
+[处理]
+从 epoch40 断点续训，test_batch_size 降到 400（只影响分批，不影响排序结果）
++ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True → 见 128375.txt
+[history]
+126581 -> wandb 403 秒退（已加 WANDB_MODE=offline）
+126629 -> 落在 main-2，torch 报 No CUDA GPUs（该节点 GPU 不可用），已 exclude
+126634 / 126640 -> 4090 无空卡，排队中取消

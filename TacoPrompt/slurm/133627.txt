@@ -1,0 +1,5 @@
+[submit] 2026-11-20 21:08  sbatch slurm/train_verb_D.slurm  ->  job 133627
+[group D] Wordnet-Verb 上的课程组（同一份 schedule）
+cfg = config_files/SemEval-V/config.test.hidden.hardD.json
+logs = slurm/out/train_verb_D_133627.out / .err
+watcher = slurm/out/watcher_133627.log（自动 dump 4 分片）

@@ -1,0 +1,6 @@
+[submit] 2026-11-20 21:08  sbatch slurm/train_mesh_B.slurm  ->  job 133624
+[group B] 只开 1 跳（L1/L2/L3），hard_ratio=0.30，无课程
+cfg = config_files/mesh/config.test.hidden.hardB.json
+node = main-12 (RTX2080Ti)   partition=RTX4090,RTX3090,RTX2080
+logs = slurm/out/train_mesh_B_133624.out / .err
+watcher = slurm/out/watcher_133624.log（早停即 scancel + 自动 dump 2 分片）

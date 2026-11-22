@@ -1,0 +1,4 @@
+[submit] 2026-11-22 09:54  sbatch slurm/train_mesh_Dc.slurm -> job 134108
+[等价于] 134104（MeSH 压缩课程），代码恢复后重投
+[状态] PENDING（Resources）
+[守卫] watcher_134108.log（exp_name=Mesh-hardDc，2 分片 dump）

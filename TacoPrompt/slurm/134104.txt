@@ -1,0 +1,4 @@
+[submit] 2026-11-22 09:50  sbatch slurm/train_mesh_Dc.slurm -> job 134104 (tp_mesh_Dc)
+[目的] MeSH 压缩课程组 Dc（hardDc: 5/10/15/21/100, rho 0/0.15/0.25/0.35/0.40）
+[结果] FAILED 00:00:13 —— 同一个 hard_ratio TypeError（代码被回退）
+[重投] -> 134108

@@ -1,0 +1,18 @@
+[submit time] 2026-11-10 20:56
+[workdir] ~/landou0510/project/TacoPrompt/TacoPrompt
+[command]
+MODEL_DIR=data/saved/mesh/TacoPromptHidden/1108_153108/models/trial1 sbatch slurm/run_dump_mesh.slurm 1 2
+[sbatch output]
+Submitted batch job 128360
+[job] tp_dump_mesh shard 1/2
+[task] MeSH hidden 测试集 Top-10 排序 dump（分片 1/2）
+[python]
+python analysis/dump_hidden_rank.py -c config_files/mesh/config.test.hidden.json \
+  -m data/saved/mesh/TacoPromptHidden/1108_153108/models/trial1/model_best.pth \
+  -o analysis/results/mesh_top10_shard1.json --shard 1 --num_shards 2 --verify
+[output]
+analysis/results/mesh_top10_shard1.json
+[logs]
+slurm/out/dump_mesh_128360.out / .err
+
+[NOTE] 该作业因减小内存申请(mem=20GB)、加 set -e，已 scancel 并重新提交 → 见 128377.txt

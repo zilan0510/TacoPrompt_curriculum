@@ -1,0 +1,5 @@
+[submit] 2026-11-22 09:54  sbatch slurm/train_verb_D_resume.slurm -> job 134107
+[等价于] 134103（Verb-D 断点续训），代码恢复后重投
+[状态] RUNNING @ main-8(RTX3090)；日志出现
+       "Checkpoint loaded. Resume training from epoch 41" + "[hard-neg] epoch 41: ratio=0.35, layers=[2..8]"
+[守卫] watcher_134107.log（exp_name=Verb-hardD，4 分片 dump）
