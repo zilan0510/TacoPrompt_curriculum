@@ -1,3 +1,18 @@
+# [导读] model.py —— 所有模型定义在这里（570 行），但只关心最后两个类
+#   前五个类都是 「baseline」，跑 TacoPrompt 时完全用不到，可以整段跳过：
+#     MatchModel / ExpanMatchModel  → TaxoExpan / TMN / Arborist 那类「结构嵌入 + 匹配头」的老方法
+#     QENModel                      → 双塔 PolyEncoder + 辅助分类头
+#     TEMPCompletion                → 用 BERT [CLS] 向量 + MLP 打分（「+ [SEP] 描述」 的拼接式）
+#   真正要读的两个：
+#     TacoPromptHidden → 主模型（config.test.hidden.json 用这个）
+#        一个 BERT + 一个 prompt: "All: [M] Parent: [M] Chlid: [M]. <Parent>: {p} <Child>: {c} [SEP] <Query>: {q}"
+#        三个 [MASK] 各自对应一个二分类子任务（整体 / 父 / 子）
+#     TacoPromptChain  → chain 变体（config.test.chain.json）
+#        分三段跑：先问 Parent，把答案写回 prompt；再问 Child；最后问 All
+#   两者共享的套路：score = logit(yes) - logit(no)（不是概率，是 log-odds）
+# 与 TaxoDiff 的关系：TaxoDiff 的 model.py 就是在 TacoPromptHidden 基础上多加了扩散模型和 e_q 表征。
+#   所以把 TacoPromptHidden 读透，再看 TaxoDiff 的 model.py 就是「原版 + 一个分支」。
+
 import time
 
 import torch
@@ -137,6 +152,8 @@ class AbstractGraphModel(nn.Module):
 
 
 class MatchModel(BaseModel, AbstractPathModel, AbstractGraphModel):
+    # [旁批] baseline：TaxoExpan / TMN / Arborist 系列。它直接拼「节点 + 图邻居 + 路径」嵌入，
+    #   再用一个匹配头（MLP/NTN/...）打分。TacoPrompt 不用，整段可跳过。
     def __init__(self, mode, **options):
         super(MatchModel, self).__init__()
         self.options = options
@@ -204,6 +221,7 @@ class MatchModel(BaseModel, AbstractPathModel, AbstractGraphModel):
 
 
 class ExpanMatchModel(BaseModel, AbstractPathModel, AbstractGraphModel):
+    # [旁批] baseline：TaxoExpan 的原始形式（只编码父侧，一次只评一个候选）。TacoPrompt 不用，可跳过。
     def __init__(self, mode, **options):
         super(ExpanMatchModel, self).__init__()
         self.options = options
@@ -257,6 +275,8 @@ class ExpanMatchModel(BaseModel, AbstractPathModel, AbstractGraphModel):
 
 
 class QENModel(BaseModel):
+    # [旁批] baseline：双塔（PolyEncoder）编码 query / parent / child / best / worst，
+    #   再用 PolyScorer + 两个辅助 head 打分。TacoPrompt 不用，可跳过。
     def __init__(self, **options):
         super(BaseModel, self).__init__()
         self.options = options
@@ -294,6 +314,9 @@ class QENModel(BaseModel):
 
 
 class TEMPCompletion(BaseModel):
+    # [旁批] baseline：TEMP。把「从 root 到 parent 的路径 + q + c」拼成一句话，取 BERT 的 [CLS] 向量，
+    #   过一层 MLP 出 1 个分数。它需要的 parent2paths 就是 dataset.py 里预先并缓存的那个。
+    #   与 TacoPrompt 的核心差别：TEMP 用 [CLS] 做回归，TacoPrompt 用 [MASK] 位置的 yes/no logits。
     def __init__(self, raw_dataset, **options):
         super(BaseModel, self).__init__()
         self.raw_dataset = raw_dataset
@@ -363,6 +386,10 @@ class TEMPCompletion(BaseModel):
 
 
 class TacoPromptHidden(BaseModel):
+    # [旁批] ★ 主模型。
+    #   名字里的 Hidden 指的是：Parent / Child 两个子任务用「可学习的隐藏表示」参与建模
+    #   （prompt 里 Parent/Child 两个位置放的是 [MASK]，而不是已经算好的 yes/no）。
+    #   而 TacoPromptChain 是先把 Parent 算成硬结果（yes/no）再写进 prompt，再算 Child，最后算 All。
     def __init__(self, raw_dataset, **options):
         super(BaseModel, self).__init__()
         self.raw_dataset = raw_dataset
@@ -373,14 +400,19 @@ class TacoPromptHidden(BaseModel):
         self.train_taxon2allemb_id = self.raw_dataset.train_taxon2allemb_id
         self.pseudo_leaf_allemb_id = self.taxon2id[raw_dataset.pseudo_leaf_node]
 
+        # [旁批] 整个模型 = 一个 BERT + 一个 MLM 头，没有别的参数。全部知识都在 prompt 的措辞里。
         self.model = BertForMaskedLM.from_pretrained(options['plm'])
         self.tokenizer = AutoTokenizer.from_pretrained(options['plm'])
+        # [旁批] yes / no 在 bert-base-uncased 里都是单 token（yes=2748, no=2053），
+        #   所以可以直接拿两个 logits 相减当二分类分数（log-odds），不需要再套 sigmoid。
         self.yes_token_id = self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize('yes'))[0]
         self.no_token_id = self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize('no'))[0]
         self.mask_token_id = self.tokenizer.mask_token_id
         self.max_seq_length = 256
 
         self.options = options
+        # [旁批] desc 是列表，下标是 node_id。读它之前一定要先 convert_id(嵌入行号) 换成 node_id，
+        #   否则会取到别的概念的描述 —— 这是排查「prompt 拼错概念」的第一现场。
         self.desc = [node.description for node_id, node in self.id2taxon.items()]
         self.device = "cuda"
 
@@ -388,6 +420,9 @@ class TacoPromptHidden(BaseModel):
 
     def _init_idx_map(self):
         # all_emb_id <-> all_node_id
+        # [旁批] 两套编号的翻译表（dataset 里那条批注说的「第三套编号」就是指 allemb_id）：
+        #   正向：嵌入行号 → 全图 node_id（convert_id 用它）
+        #   倒排：node_id → 嵌入行号（测试时把真值 Taxon 转成索引会用到）
         self.all_embed_id2all_node_id = {}
         for id, taxon in self.train_allemb_id2taxon.items():
             self.all_embed_id2all_node_id[id] = self.taxon2id[taxon]
@@ -397,6 +432,12 @@ class TacoPromptHidden(BaseModel):
         return self.all_embed_id2all_node_id[id]
 
     def get_lm_inputs(self, pit, qid, cit, label, pl, cl, tc=False):
+        # [旁批] ★ 这个函数就是论文 §4.2 的 "Hidden" prompt 模板，拼两条句子：
+        #   推理用：All: [MASK] Parent: [MASK] Chlid: [MASK]. <Parent>: {p_desc} <Child>: {c_desc} [SEP] <Query>: {q_desc}
+        #   标签用：All: yes/no Parent: yes/no Child: yes/no. <Parent>: ... <Child>: ... [SEP] <Query>: ...
+        #   两份句子逐 token 对齐（都是 max_length=256, padding='max_length'），
+        #   然后用 input_ids == mask_token_id 把「三个 [MASK] 位置的标签」挑出来作为 label_ids。
+        #   这就是 MLM 训 TacoPrompt 的全部秘密：不新加分类头，而是把分类问题变成「填空」。
         max_seq_length = self.max_seq_length
         tokenizer = self.tokenizer
         cls_token = tokenizer.cls_token
@@ -409,6 +450,14 @@ class TacoPromptHidden(BaseModel):
         sentences_ground_truth = []
 
         for i in range(label.shape[0]):
+            # [旁批] ★★ 三个 [MASK] 对应的就是三个子任务：
+            #   第 1 个（All）    → 这个位置整体对不对（pct）
+            #   第 2 个（Parent） → 父对不对（pt）
+            #   第 3 个（Child）  → 子对不对（ct）
+            #   [旁批?] 注意上面用的是 "Chlid"（拼错），下面 ground truth 用的是 "Child"。
+            #     后果：Child → 1 个 token；Chlid → 2 个 token（ch + ##lid），模板长 1 个 token。
+            #     不影响打分（靠 mask 值定位而不是文本匹配），但改代码时别把它 "修正" 成 Child，
+            #     否则与已发布实验不可比。
             a_prompt = "All: {} Parent: {} Chlid: {}. <Parent>: {} <Child>: {}".format(
                 mask_token, mask_token, mask_token, self.desc[self.convert_id(pit[i].item())], self.desc[self.convert_id(cit[i].item())])
             b_prompt = "<Query>: {}".format(self.desc[qid[i]])
@@ -434,22 +483,45 @@ class TacoPromptHidden(BaseModel):
         return input_ids, label_ids, attention_mask
 
     def scorer(self, pit, qid, cit, pct, pl, cl):
+        # [旁批] ★ 打分函数。注意它其实算了两份输入：
+        #   第一份 sentences_prompt（带 [MASK]）送去 forward → 得到 logits
+        #   第二份 sentences_ground_truth（带 yes/no）只用来生成 label_ids → 只在训练时用
+        #   测试时虽然也白算了一份 gt 句子的 tokenize，但不影响结果（可优化点）。
         batch_input_ids, batch_labels, batch_attention_mask = self.get_lm_inputs(pit, qid, cit, pct, pl, cl)
         batch_lm_inputs = {'input_ids': batch_input_ids,
                            'attention_mask': batch_attention_mask}
         batch_lm_inputs = {k: v.to(self.device) for k, v in batch_lm_inputs.items()}
+        # [旁批?] ★ 这里是全流程最大的算力浪费：BertForMaskedLM.forward 会对全部 256 个位置
+        #   跑 MLM 头（得到 (B,256,30522) 的 logits），而我们只偷 3 个 [MASK] 位置。
+        #   浪费的不仅是 ~22% 的 FLOPs，更是显存：batch=775 时这个中间张量 fp16 就有 12 GB。
+        #   优化办法：先跑 model.model.bert(...) 拿 hidden，再只用 3 行跑 model.model.cls(rows)。
         outputs = self.model(**batch_lm_inputs)
-        score = outputs[0][batch_lm_inputs['input_ids'] == self.mask_token_id]
+        score = outputs[0][batch_lm_inputs['input_ids'] == self.mask_token_id]   # (B*3, V)
+        # [旁批] 分数 = logit(yes) - logit(no)，即 log-odds。
+        #   因为训练用 BCEWithLogits，这个量与 loss 的输入完全同量纲，不需要再 sigmoid。
         pred_scores = score[:, self.yes_token_id] - score[:, self.no_token_id]
+        # [旁批] view(B, 3)：第 0 列是 All、第 1 列是 Parent、第 2 列是 Child。
+        #   测试时只取 score[:, 0]（All 位）；训练时三列都要（对应 L_a / L_p / L_c）。
         pred_scores = pred_scores.view(pit.shape[0], -1)
         return pred_scores
 
     def forward(self, qs, ps, cs, bs, ws, pe, ce, be, we, pit, qit, cit, pct, pt, ct):
+        # [旁批] forward 其实只用了 cit / pct / pt / ct 四个参数，其余全部忽略。
+        #   qs/ps/cs/bs/ws（五列 tokenize 过的文本）在这里被完全丢弃 —— 它们的存在只是为了
+        #   兼容早期代码。这也是为什么 collate_fn 里那五行 tokenizer 可以安全地改成空 dict。
+        #   [旁批] qit 是「嵌入行号」，要先 convert_id 换成 node_id，因为 scorer 里用 self.desc[qid[i]] 索引。
         qid = [self.convert_id(qit[i].item()) for i in range(qit.shape[0])]
         return self.scorer(pit, qid, cit, pct, pt, ct)
     
 
 class TacoPromptChain(BaseModel):
+    # [旁批] ★ chain 变体：把一个多答案的 prompt 拆成三段串行问，后一模用前一模的「硬结果」。
+    #   第 1 模 subtask='p'："Parent: [MASK]. <Parent>: {p}" [SEP] <Query>: {q}         → 父对不对
+    #   第 2 模 subtask='c'："Child: [MASK] Parent: {父的答案}. <Child>: {c}" ...       → 子对不对
+    #   第 3 模 subtask='a'："All: [MASK] Parent: {父答案} Child: {子答案}. ..."         → 整体对不对
+    #   关键区别：Hidden 是把三个子问题写在同一句里同时算（soft、可学习），
+    #   Chain 是把上一段的 yes/no 当文本拼进下一段（hard、离散）。所以 Chain 每步要 forward 3 次，
+    #   _test 里就是一个 query 跑 3 轮 scorer（见 trainer/trainer.py 的 TrainerChain._test）。
     def __init__(self, raw_dataset, **options):
         super(BaseModel, self).__init__()
         self.raw_dataset = raw_dataset
@@ -484,6 +556,11 @@ class TacoPromptChain(BaseModel):
         return self.all_embed_id2all_node_id[id]
 
     def get_lm_inputs(self, pit, qid, cit, label, pl, cl, pe, ce, p_ans=None, c_ans=None, subtask='a', tc=False):
+        # [旁批] 三种 subtask 的 prompt 模板完全不同，这是 chain 的核心：
+        #   'p' → 只问父，没有子相关字段
+        #   'c' → 问子，并把【父的答案】以文本形式拼在前面（信息从上一模传来）
+        #   'a' → 问整体，父子两个答案都作为文本拼进来
+        #   同一个函数先拼「推理用（带 [MASK]）」再拼「标签用（带 yes/no）」，两段逻辑几乎重复。
         max_seq_length = self.max_seq_length
         tokenizer = self.tokenizer
         cls_token = tokenizer.cls_token
@@ -549,6 +626,8 @@ class TacoPromptChain(BaseModel):
         return input_ids, label_ids, attention_mask
 
     def scorer(self, pit, qid, cit, pct, pl, cl, pe, ce, p_ans=None, c_ans=None, subtask='a'):
+        # [旁批] ★ Chain 的 scorer 返回的是【两个值】：分数和硬答案。
+        #   硬答案 ans 会被 TrainerChain._test 拿去当下一模的 p_ans / c_ans（串行推理的关键）。
         batch_input_ids, batch_labels, batch_attention_mask = self.get_lm_inputs(pit, qid, cit, pct, pl, cl, pe, ce, p_ans=p_ans, c_ans=c_ans, subtask=subtask)
         # batch_lm_inputs = {'input_ids': batch_input_ids,
         #                    'attention_mask': batch_attention_mask,
@@ -562,6 +641,8 @@ class TacoPromptChain(BaseModel):
         pred_scores = pred_scores.view(pit.shape[0], -1)
         
         # results
+        # [旁批] 硬答案 = logit(yes) > logit(no)（等价于 score > 0），没有阈值可调。
+        #   这个 0-1 决策会被直接拼进下一模的 prompt 文本，所以错一步后面全错 —— chain 的弱点。
         ans = score[:, self.yes_token_id] > score[:, self.no_token_id]
         ans = ans.view(pit.shape[0], -1)
         return pred_scores, ans
