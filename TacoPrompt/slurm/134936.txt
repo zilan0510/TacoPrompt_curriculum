@@ -1,0 +1,13 @@
+# 作业 134936 — MeSH-D（课程原表，重跑；权重曾因撞目录丢失）
+# 提交时间：2026-11-23 11:06:45
+# 节点：main-6 (RTX4090)
+sbatch slurm/train_mesh_D.slurm
+# 实际执行命令（脚本内）：
+#   python train.py --config config_files/mesh/config.test.hidden.hardD.json --suffix mesh_D
+# 输出目录：data/saved/mesh/TacoPromptHidden/1123_110658_mesh_D
+# 日志：slurm/out/train_mesh_D_134936.out
+
+# 守卫（早停即停 + 自动 dump，2 分片）
+nohup bash slurm/watch_and_dump.sh 134936 slurm/out/train_mesh_D_134936.out \
+      data/saved/mesh/TacoPromptHidden config_files/mesh/config.test.hidden.hardD.json \
+      mesh_D 2 Mesh-hardD mesh_D &

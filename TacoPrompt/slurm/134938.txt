@@ -1,0 +1,13 @@
+# 作业 134938 — Verb-C（ρ=0.30，固定 L1–L8；补齐 Verb 矩阵缺失组）
+# 提交时间：2026-11-23 11:06:45
+# 节点：main-12 (RTX2080Ti)，--tbs 300 防验证 OOM
+sbatch slurm/train_verb_C.slurm
+# 实际执行命令（脚本内）：
+#   python train.py --config config_files/SemEval-V/config.test.hidden.hardC.json --tbs 300 --suffix verb_C
+# 输出目录：data/saved/wordnet_verb/TacoPromptHidden/1123_110658_verb_C
+# 日志：slurm/out/train_verb_C_134938.out
+
+# 守卫（早停即停 + 自动 dump，4 分片）
+nohup bash slurm/watch_and_dump.sh 134938 slurm/out/train_verb_C_134938.out \
+      data/saved/wordnet_verb/TacoPromptHidden config_files/SemEval-V/config.test.hidden.hardC.json \
+      verb_C 4 Verb-hardC verb_C &
