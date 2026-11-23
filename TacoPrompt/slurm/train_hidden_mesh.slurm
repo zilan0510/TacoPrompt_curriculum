@@ -23,5 +23,5 @@ export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 
 echo "job start: $(date)"
-python train.py --config config_files/mesh/config.test.hidden.json
+python train.py --config config_files/mesh/config.test.hidden.json --suffix mesh_A
 echo "job end: $(date)"

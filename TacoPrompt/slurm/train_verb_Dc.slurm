@@ -22,5 +22,5 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo "job start: $(date)  cfg=config_files/SemEval-V/config.test.hidden.hardDc.json"
 set -e
-python train.py --config config_files/SemEval-V/config.test.hidden.hardDc.json --tbs 300
+python train.py --config config_files/SemEval-V/config.test.hidden.hardDc.json --tbs 300 --suffix verb_Dc
 echo "job end: $(date)"

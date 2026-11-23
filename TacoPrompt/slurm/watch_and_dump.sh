@@ -13,6 +13,7 @@ CFG=${4:?need config}
 TAG=${5:?need tag}
 SHARDS=${6:-2}
 EXP=${7:-}
+SUF=${8:-}
 
 cd ~/landou0510/project/TacoPrompt/TacoPrompt
 source ~/anaconda3/etc/profile.d/conda.sh
@@ -30,7 +31,15 @@ do_finish() {
     scancel "$JOB" 2>/dev/null || true
     sleep 20
     MODEL_DIR=$(ls -dt "${DATASET_DIR}"/*/models/trial1 2>/dev/null | head -1)
-    if [ -n "$EXP" ]; then
+    if [ -n "$SUF" ]; then
+        # 优先用 --suffix 生成的目录名精确定位（同名 exp_name 的并发 run 不会互相拿错）
+        for d in $(ls -dt "${DATASET_DIR}"/*/models/trial1 2>/dev/null); do
+            tsdir=$(basename "$(dirname "$(dirname "$d")")")
+            case "$tsdir" in
+                *"_${SUF}") MODEL_DIR="$d"; break ;;
+            esac
+        done
+    elif [ -n "$EXP" ]; then
         # 只认 exp_name 匹配的 run 目录，避免多个 run 并行时拿到别人的 model_best
         for d in $(ls -dt "${DATASET_DIR}"/*/models/trial1 2>/dev/null); do
             cfg="$d/../config.json"

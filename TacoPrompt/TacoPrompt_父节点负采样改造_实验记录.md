@@ -191,3 +191,36 @@ python analysis/error_analysis.py -d analysis/results/mesh_B_top10_shard0.json a
 | 4 直接父 | 46–100 | **22–100** | 0.40 | L1–L8 |
 
 好处：**首次验证（epoch 40）之前课程已完整开启**，早停窗口（40~46）内模型始终处于「全 8 层」状态，L1 有 ~20 个 epoch 的训练量。配置见 `config_files/*/config.test.hidden.hardDc.json`。
+
+### 6.6 事故 4：同秒启动 → 同一目录互相覆盖（严重）
+
+`parse_config.py` 的保存目录是 `save_dir/<name>/<%m%d_%H%M%S>/models`，**没有唯一化**。
+两个同类 run 若在同一秒创建 ConfigParser，就会写进同一个目录，`model_best.pth` 后写者覆盖先写者。
+
+实测两处：
+
+| 数据集 | 作业 | 结果 |
+|---|---|---|
+| MeSH | 133629 (C) 与 133630 (D)，均 `Start=2026-11-20T22:04:44` → 同写 `1120_220500` | 该目录唯一留下的 `model_best.pth` 指纹是 `epoch=44, monitor_best=0.60219` → **属于 C**；**D 的权重已丢失**；`mesh_D_top10_shard*.json` 实为 C 的结果（已改名 `mesh_C_*`） |
+| Verb | 134107 (D 续训) 与 134109 (Dc)，均 `job start: Sun Nov 22 09:54:15` → 同写 `1122_095425` | 该目录 `info.log` 里既有 `epoch: 1,2,3…`（Dc）也有 `epoch: 41…`（D 续训），`model_best.pth`(11-22 13:43:52) 属 **D**；已把目录整体改名为 `1122_095425_verbD_134107` 并为仍在跑的 134109 重建空目录（其 `mkdir/保存` 走相对旧路径 → 之后写进新空目录，不再覆盖 D） |
+
+**修复**：
+
+1. 所有 `slurm/train_*.slurm` 的 `python train.py` 追加 `--suffix <tag>`（`parse_config.py` 已支持把 suffix 拼进时间戳目录名），例如 `1120_220500_mesh_D`；
+2. `slurm/watch_and_dump.sh` 新增第 8 个参数 `SUF`，按目录名后缀精确定位 `model_best.pth`（比 `exp_name` 可靠，因为同名 exp_name 会出现在多个 run 里）；
+3. 判权重归属的可靠指纹只有 checkpoint 里的 `epoch` + `monitor_best`（`config.json` 的 `exp_name` 会被后写者覆盖，日志里也不一定打印保存路径）。
+
+### 6.7 MeSH 测试集结果（A / B / C）
+
+| 组 | 作业 | hit@10 | MRR | MRR@10(scaled) | 父错子对 | 父对子错 | 父子皆错 | 报告 |
+|---|---|---|---|---|---|---|---|---|
+| A baseline | 126630 | **0.8339** | 0.6695 | 0.6695 | 4402 (61.41%) | 931 (12.99%) | 1835 (25.60%) | `mesh_error_analysis.md` |
+| B ρ=0.30 层[1,2,3] | 133628 | 0.7668 | 0.2439 | 0.5797 | 2957 (40.36%) | 1595 (21.77%) | 2774 (37.87%) | `mesh_B_error_analysis.md` |
+| C ρ=0.30 层[1..8] | 133629 | 0.7485 | 0.2248 | 0.5720 | 3194 (43.41%) | 1520 (20.66%) | 2644 (35.93%) | `mesh_C_error_analysis.md` |
+
+（B/C 报告的“零”节只有 hit@k / MRR / MR，因为 `--title` 未带 baseline 时不给论文对齐列；
+A 的 `mrr_scaled_10` 与 `mrr` 数值相同是 A 报告早期版本的算法口径差异，需以 B/C 格式重跑后再横向比。）
+
+**结论（暂定）**：随机插负例的 baseline 在 hit@10 上明显更好；B/C 的**父错子对占比从 61.4% 降到 40~43%**（正是改造目标），
+但整体排序被拖差（hit@10 -0.07 ~ -0.09），说明「用真父节点当负例」确实压低了父节点得分，也伤到了同父兄弟的相对次序。
+需 D（ρ=0.40 随机 10/20/32/45/100 层可用）与 Dc 结果才能判断是否存在能兼顾两头的配比。

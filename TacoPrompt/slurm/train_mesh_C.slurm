@@ -22,5 +22,5 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo "job start: $(date)  cfg=config_files/mesh/config.test.hidden.hardC.json"
 set -e
-python train.py --config config_files/mesh/config.test.hidden.hardC.json
+python train.py --config config_files/mesh/config.test.hidden.hardC.json --suffix mesh_C
 echo "job end: $(date)"

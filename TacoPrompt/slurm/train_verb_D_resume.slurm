@@ -26,5 +26,5 @@ echo "job start: $(date)"
 set -e
 python train.py --config config_files/SemEval-V/config.test.hidden.hardD.json \
   -r data/saved/wordnet_verb/TacoPromptHidden/1120_211631/models/trial1/checkpoint-epoch40.pth \
-  --tbs 400
+  --tbs 400 --suffix verb_D_resume
 echo "job end: $(date)"
